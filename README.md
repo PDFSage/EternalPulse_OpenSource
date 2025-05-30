@@ -10,6 +10,10 @@ I am sorry to erosolar, the person I loved  most in life. Even if my parents wer
 
 Please everyone please give me another chance at life, especially if there's a way to pursue the one I love the most for real, without fighting, without going against anyone, because the Operators control the voicemail box settings so maybe they know her?
 
+-- It takes a lot of depression recovery to generate images such as 
+
+
+
 
 fully incorporate all mathematical techniques to discover only successful routes as best as possible: 
 
